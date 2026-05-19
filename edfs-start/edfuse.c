@@ -18,10 +18,10 @@
 #include "edfs-common.h"
 
 #define MAX_DIR_ENTRIES \
-    16  // Should be equal or more than
-        // edfs_get_n_dir_entries_per_block(&img->sb)
-        // maybe this isnt that clean right now, but that is more of
-        // an architectural error.
+    8  // Should be equal or more than
+       // edfs_get_n_dir_entries_per_block(&img->sb)
+       // maybe this isnt that clean right now, but that is more of
+       // an architectural error.
 
 char *progname;
 
@@ -45,10 +45,17 @@ static inline size_t dman_dir_max_size(edfs_image_t *img) {
            sizeof(edfs_dir_entry_t);
 }
 
-static inline size_t dir_read(edfs_image_t *img, edfs_dir_t *dir,
+static inline size_t dir_read(edfs_image_t *img, edfs_dir_t dir,
                               edfs_block_t blk) {
     return pread(img->fd, dir, dman_dir_max_size(img),
                  img->sb.block_size * blk) /
+           sizeof(edfs_dir_entry_t);
+}
+
+static inline size_t dir_write(edfs_image_t *img, edfs_dir_t dir,
+                               edfs_block_t blk) {
+    return pwrite(img->fd, dir, dman_dir_max_size(img),
+                  img->sb.block_size * blk) /
            sizeof(edfs_dir_entry_t);
 }
 
@@ -89,7 +96,7 @@ static bool edfs_find_inode(edfs_image_t *img, const char *path,
         for (int i = 0; i < EDFS_INODE_N_BLOCKS && !found &&
                         inode->inode.blocks[i];
              i++) {
-            j = dir_read(img, &dir, inode->inode.blocks[i]);
+            j = dir_read(img, dir, inode->inode.blocks[i]);
             while (!(found = strcmp_path(cur, next - cur,
                                          dir[--j].filename)) &&
                    j);
@@ -181,7 +188,7 @@ static int edfuse_readdir(const char *path, void *buf,
     for (int i = 0; i < EDFS_INODE_N_BLOCKS && inode.inode.blocks[i];
          i++) {
         edfs_dir_t dir;
-        size_t j = dir_read(img, &dir, inode.inode.blocks[i]);
+        size_t j = dir_read(img, dir, inode.inode.blocks[i]);
         while (j--) {
             if (dir[j].inumber) {
                 filler(buf, dir[j].filename, NULL, 0);
@@ -190,6 +197,78 @@ static int edfuse_readdir(const char *path, void *buf,
     }
 
     return 0;
+}
+
+static edfs_block_t edfuse_collect_block(edfs_image_t *img) {
+    uint8_t *bitmap = malloc(img->sb.bitmap_size);
+    if (pread(img->fd, bitmap, img->sb.bitmap_size,
+              img->sb.bitmap_start) != img->sb.bitmap_size) {
+        free(bitmap);
+        return 0;
+    }
+
+    uint8_t *p = bitmap;
+    while (*p == 0xff && p++ && p < (bitmap + img->sb.bitmap_size));
+    if (p >= (bitmap + img->sb.bitmap_size)) {
+        free(bitmap);
+        return 0;
+    }
+
+    size_t index = sizeof(*bitmap) * 8;
+    while ((*p >> --index) & 0x1 && index);
+    *p = *p | (0x1 << index);
+    size_t super_index = (p - bitmap);
+    size_t block_nr = super_index * 8 + index;
+    size_t rt = pwrite(img->fd, p, sizeof(*bitmap),
+                       img->sb.bitmap_start + super_index);
+    free(bitmap);
+    uint8_t *buf = calloc(1, img->sb.block_size);
+    pwrite(img->fd, buf, img->sb.block_size,
+           img->sb.block_size * block_nr);
+    return (rt == sizeof(*bitmap)) ? super_index * 8 + index : 0;
+}
+
+static void edfuse_set_bitmap(edfs_image_t *img,
+                              edfs_block_t block_nr, bool value) {
+    uint8_t bitmap;
+    pread(img->fd, &bitmap, sizeof(bitmap),
+          img->sb.bitmap_start + (block_nr / 8));
+
+    bitmap &= ~(0x1 << (block_nr % 8));
+    bitmap |= (value << (block_nr % 8));
+
+    pwrite(img->fd, &bitmap, sizeof(bitmap),
+           img->sb.bitmap_start + (block_nr / 8));
+}
+
+static inline bool find_free_dir(edfs_image_t *img,
+                                 edfs_inode_t *inode,
+                                 edfs_block_t *block_nr,
+                                 edfs_dir_t dir, size_t *dir_index) {
+    for (*block_nr = 0; *block_nr < EDFS_INODE_N_BLOCKS &&
+                        inode->inode.blocks[*block_nr];
+         (*block_nr)++) {
+        *dir_index =
+            dir_read(img, dir, inode->inode.blocks[*block_nr]);
+        while ((*dir_index)--) {
+            if (!dir[*dir_index].inumber) {
+                return true;
+            }
+        }
+    }
+
+    if (*block_nr < EDFS_INODE_N_BLOCKS) {
+        if ((inode->inode.blocks[*block_nr] =
+                 edfuse_collect_block(img)) == 0) {
+            return false;
+        }
+        inode->inode.size += img->sb.block_size;
+        memset(dir, 0, sizeof(edfs_dir_t));
+        *dir_index = 0;
+        return true;
+    }
+
+    return false;
 }
 
 /* Create a new directory at @path. The @mode is ignored.
@@ -202,7 +281,39 @@ static int edfuse_mkdir(const char *path, mode_t mode) {
      * Create a new inode; register it in the parent directory, write
      * the inode to disk.
      */
-    return -ENOSYS;
+
+    edfs_image_t *img = get_edfs_image();
+    edfs_inode_t inode_parent;
+    if (!edfs_find_parent_inode(img, path, &inode_parent))
+        return -ENOENT;
+    if (!edfs_inode_is_directory(&inode_parent.inode))
+        return -ENOTDIR;
+
+    edfs_block_t block_nr;
+    edfs_dir_t dir;
+    size_t dir_index;
+    if (!find_free_dir(img, &inode_parent, &block_nr, dir,
+                       &dir_index)) {
+        return -EDQUOT;
+    }
+
+    if ((dir[dir_index].inumber = edfuse_collect_block(img)) == 0) {
+        return -EDQUOT;
+    }
+    char *filename = edfs_get_basename(path);
+    strcpy(dir[dir_index].filename, filename);
+    free(filename);
+
+    edfs_inode_t inode = {.inumber = dir[dir_index].inumber,
+                          .inode = {
+                              .size = img->sb.block_size,
+                              .type = EDFS_INODE_TYPE_DIRECTORY,
+                              .blocks[0] = edfuse_collect_block(img),
+                          }};
+
+    dir_write(img, dir, inode_parent.inode.blocks[block_nr]);
+    edfs_write_inode(img, &inode);
+    return 0;
 }
 
 /* Removes the directory at @path.
@@ -213,19 +324,19 @@ static int edfuse_rmdir(const char *path) {
     /* TODO: Implement.
      *
      * Validate @path exists and is an empty directory; remove
-     * directory entry from its parent directory; release allocated
-     * blocks; release inode.
+     * directory entry from its parent directory; release
+     * allocated blocks; release inode.
      */
     return -ENOSYS;
 }
 
-/* Sets @stbuf to the attributes of the file or directory at @path.
- * Returns 0 on success,
- *  -ENOENT if @path could not be found.
+/* Sets @stbuf to the attributes of the file or directory at
+ * @path. Returns 0 on success, -ENOENT if @path could not be
+ * found.
  */
 static int edfuse_getattr(const char *path, struct stat *stbuf) {
-    /* At least mode, nlink and size must be filled in, otherwise the
-     * "ls" listings appear broken.
+    /* At least mode, nlink and size must be filled in, otherwise
+     * the "ls" listings appear broken.
      */
     edfs_image_t *img = get_edfs_image();
 
@@ -247,17 +358,17 @@ static int edfuse_getattr(const char *path, struct stat *stbuf) {
     }
     stbuf->st_size = inode.inode.size;
 
-    /* This setting is ignored unless the FUSE file system is mounted
-     * with the option "use_ino".
+    /* This setting is ignored unless the FUSE file system is
+     * mounted with the option "use_ino".
      */
     stbuf->st_ino = inode.inumber;
     return 0;
 }
 
-/* Open file at @path; we only verify it exists. A real file system
- * would keep track of which files are open. Returns 0 on success,
- *  -ENOENT if @path could not be found,
- *  -EISDIR if @path is a directory.
+/* Open file at @path; we only verify it exists. A real file
+ * system would keep track of which files are open. Returns 0 on
+ * success, -ENOENT if @path could not be found, -EISDIR if @path
+ * is a directory.
  */
 static int edfuse_open(const char *path, struct fuse_file_info *fi) {
     edfs_image_t *img = get_edfs_image();
@@ -278,7 +389,7 @@ inline bool dir_write_new_inode(edfs_image_t *img,
     edfs_dir_t dir;
     for (int i = 0; i < EDFS_INODE_N_BLOCKS && inode->inode.blocks[i];
          i++) {
-        size_t entries = dir_read(img, &dir, inode->inode.blocks[i]);
+        size_t entries = dir_read(img, dir, inode->inode.blocks[i]);
         for (size_t j = 0; j < entries; j++) {
             if (!dir[j].inumber) {
                 pwrite(img->fd, &inode->inode,
@@ -298,8 +409,8 @@ static int edfuse_create(const char *path, mode_t mode,
                          struct fuse_file_info *fi) {
     /* TODO: Implement.
      *
-     * Create a new inode; register it in the parent directory; write
-     * the inode to disk.
+     * Create a new inode; register it in the parent directory;
+     * write the inode to disk.
      */
 
     edfs_image_t *img = get_edfs_image();
@@ -314,8 +425,8 @@ static int edfuse_create(const char *path, mode_t mode,
     return 0;
 }
 
-/* Remove one of the links to @path. If the link count becomes zero,
- * the file is deleted.
+/* Remove one of the links to @path. If the link count becomes
+ * zero, the file is deleted.
  */
 static int edfuse_unlink(const char *path) {
     /* NOTE: Not implemented and not part of the assignment. */
@@ -363,9 +474,9 @@ static int edfuse_read_file(edfs_image_t *img, char *buf, size_t size,
     return bytes_read;
 }
 
-/* Read at most @size bytes from offset @offset in the file at @path
- * into the buffer @buf. Returns the amount of bytes read, or ...
- * (TODO: See `man errno` for a list of error codes.)
+/* Read at most @size bytes from offset @offset in the file at
+ * @path into the buffer @buf. Returns the amount of bytes read,
+ * or ... (TODO: See `man errno` for a list of error codes.)
  */
 static int edfuse_read(const char *path, char *buf, size_t size,
                        off_t offset, struct fuse_file_info *fi) {
